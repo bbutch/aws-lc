@@ -533,6 +533,235 @@ class KEMKeyShare : public SSLKeyShare {
   UniquePtr<EVP_PKEY_CTX> ctx_;
 };
 
+// A HybridKeyShare consists of key shares from two or more component groups,
+// all of which are used to generate a hybrid shared secret.
+// See https://datatracker.ietf.org/doc/html/draft-ietf-tls-hybrid-design.
+  class HybridKeyShare : public SSLKeyShare {
+  public:
+    HybridKeyShare(uint16_t group_id) : group_id_(group_id), hybrid_group_(nullptr) {
+      for (UniquePtr<SSLKeyShare> &key_share : key_shares_) {
+        key_share = nullptr;
+      }
+    }
+
+    uint16_t GroupID() const override { return group_id_; }
+
+    bool Offer(CBB *out) override {
+      // Ensure |out| is valid, has no children, and has been initialized.
+      // We check that |out| has no children because otherwise CBB_data()
+      // will produce a fatal error by way of assert(cbb->child == NULL);
+      if (!out || out->child || !CBB_data(out)) {
+        OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
+        return false;
+      }
+
+      if (!init_component_key_shares()) {
+        return false;
+      }
+
+      // Iterate through the component groups and Offer() each of their key
+      // shares. If one of the calls to a component Offer() fails,
+      // OPENSSL_PUT_ERROR will be set appropriately in that component.
+      for (const UniquePtr<SSLKeyShare> &key_share : key_shares_) {
+        if (!key_share || !key_share->Offer(out)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    bool Accept(CBB *out_public_key, Array<uint8_t> *out_secret,
+                uint8_t *out_alert, Span<const uint8_t> peer_key) override {
+      if (!out_alert) {
+        OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
+        return false;
+      }
+
+      // Set alert to internal error by default
+      *out_alert = SSL_AD_INTERNAL_ERROR;
+
+      if (!out_secret|| !peer_key.data()) {
+        OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
+        return false;
+      }
+
+      // Ensure |out_public_key| is valid, has no children, and has been
+      // initialized. We check that |out_public_key| has no children because
+      // otherwise CBB_data() will produce a fatal error by way of
+      // assert(cbb->child == NULL);
+      if (!out_public_key || out_public_key->child || !CBB_data(out_public_key)) {
+        OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
+        return false;
+      }
+
+      if (!init_component_key_shares()) {
+        return false;
+      }
+
+      // A hybrid shared secret with two components should be 64 bytes.
+      // If it happens to be larger, the CBB will grow accordingly.
+      CBB hybrid_shared_secret;
+      if (!CBB_init(&hybrid_shared_secret, 64)) {
+        OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+        return false;
+      }
+
+      // Accept() each component key share. Each component's Accept() function
+      // will generate a shared secret and a public key to be sent back to
+      // the peer. The hybrid public key is the concatenation of all component
+      // public keys; the hybrid shared secret is the concatenation of all
+      // component shared secrets.
+      size_t peer_key_index = 0;
+      for (size_t i = 0; i < NUM_HYBRID_COMPONENTS; i++) {
+        size_t component_key_size = hybrid_group_->offer_share_sizes[i];
+
+        // Verify that |peer_key| contains enough data
+        if (peer_key_index + component_key_size > peer_key.size()) {
+          CBB_cleanup(&hybrid_shared_secret);
+          *out_alert = SSL_AD_DECODE_ERROR;
+          OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+          return false;
+        }
+
+        Span<const uint8_t> component_key =
+          peer_key.subspan(peer_key_index, component_key_size);
+
+        Array<uint8_t> component_secret;
+        if (!key_shares_[i] ||
+            !key_shares_[i]->Accept(out_public_key, &component_secret, out_alert, component_key) ||
+            !CBB_add_bytes(&hybrid_shared_secret, component_secret.data(), component_secret.size())) {
+          CBB_cleanup(&hybrid_shared_secret);
+          OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+          return false;
+        }
+
+        peer_key_index += component_key_size;
+      }
+
+      // Final validation that |peer_key| was the correct size
+      if (peer_key_index != peer_key.size()) {
+        CBB_cleanup(&hybrid_shared_secret);
+        *out_alert = SSL_AD_DECODE_ERROR;
+        OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+        return false;
+      }
+
+      // Retain the hybrid shared secret for our use.
+      if (!CBBFinishArray(&hybrid_shared_secret, out_secret)) {
+        CBB_cleanup(&hybrid_shared_secret);
+        OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+        return false;
+      }
+
+      // Success; clear the alert
+      *out_alert = 0;
+      return true;
+    }
+
+    bool Finish(Array<uint8_t> *out_secret, uint8_t *out_alert,
+                Span<const uint8_t> peer_key) override {
+      if (!out_alert) {
+        OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
+        return false;
+      }
+
+      // Set alert to internal error by default
+      *out_alert = SSL_AD_INTERNAL_ERROR;
+
+      if (!out_secret || !peer_key.data()) {
+        OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
+        return false;
+      }
+
+      // hybrid_group_ should have been initialized
+      // in a previous call to Offer()
+      if (!hybrid_group_) {
+        OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+        return false;
+      }
+
+      // A hybrid shared secret with two components should be 64 bytes.
+      // If it happens to be larger, the CBB will grow accordingly.
+      CBB hybrid_shared_secret;
+      if (!CBB_init(&hybrid_shared_secret, 64)) {
+        OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+        return false;
+      }
+
+      // Finish() each component key share. Each component's Finish() function
+      // will generate a shared secret. The hybrid shared secret is the
+      // concatenation of all component shared secrets.
+      size_t peer_key_index = 0;
+      for (size_t i = 0; i < NUM_HYBRID_COMPONENTS; i++) {
+        size_t component_key_size = hybrid_group_->accept_share_sizes[i];
+
+        // Verify that |peer_key| contains enough data
+        if (peer_key_index + component_key_size > peer_key.size()) {
+          CBB_cleanup(&hybrid_shared_secret);
+          *out_alert = SSL_AD_DECODE_ERROR;
+          OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+          return false;
+        }
+
+        Span<const uint8_t> component_key =
+          peer_key.subspan(peer_key_index, component_key_size);
+
+        Array<uint8_t> component_secret;
+        if (!key_shares_[i] ||
+            !key_shares_[i]->Finish(&component_secret, out_alert, component_key) ||
+            !CBB_add_bytes(&hybrid_shared_secret, component_secret.data(), component_secret.size())) {
+          CBB_cleanup(&hybrid_shared_secret);
+          OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+          return false;
+        }
+
+        peer_key_index += component_key_size;
+      }
+
+      // Final validation that |peer_key| was the correct size
+      if (peer_key_index != peer_key.size()) {
+        CBB_cleanup(&hybrid_shared_secret);
+        *out_alert = SSL_AD_DECODE_ERROR;
+        OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+        return false;
+      }
+
+      // Retain the hybrid shared secret for our use.
+      if (!CBBFinishArray(&hybrid_shared_secret, out_secret)) {
+        CBB_cleanup(&hybrid_shared_secret);
+        OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+        return false;
+      }
+
+      // Success; clear the alert
+      *out_alert = 0;
+      return true;
+    }
+
+  private:
+   bool init_component_key_shares() {
+      // The component key shares should only be initialized once
+      if (hybrid_group_) {
+        return false;
+      }
+
+     for (const HybridGroup &hybrid_group : HybridGroups()) {
+       if (group_id_ == hybrid_group.group_id) {
+         hybrid_group_ = &hybrid_group;
+         for (size_t i = 0; i < NUM_HYBRID_COMPONENTS; i++) {
+           key_shares_[i] = SSLKeyShare::Create(hybrid_group.component_group_ids[i]);
+         }
+         return true;
+       }
+     }
+      return false;
+   }
+
+   uint16_t group_id_;
+   const HybridGroup *hybrid_group_;
+   UniquePtr<SSLKeyShare> key_shares_[NUM_HYBRID_COMPONENTS];
+};
+
 CONSTEXPR_ARRAY NamedGroup kNamedGroups[] = {
     {NID_secp224r1, SSL_CURVE_SECP224R1, "P-224", "secp224r1"},
     {NID_X9_62_prime256v1, SSL_CURVE_SECP256R1, "P-256", "prime256v1"},
@@ -540,17 +769,68 @@ CONSTEXPR_ARRAY NamedGroup kNamedGroups[] = {
     {NID_secp521r1, SSL_CURVE_SECP521R1, "P-521", "secp521r1"},
     {NID_X25519, SSL_CURVE_X25519, "X25519", "x25519"},
     {NID_CECPQ2, SSL_CURVE_CECPQ2, "CECPQ2", "CECPQ2"},
+    {NID_SECP256R1_KYBER512_R3, SSL_CURVE_SECP256R1_KYBER512_R3, "P-256_Kyber512_R3", "prime256v1_kyber512_r3"},
+    {NID_X25519_KYBER512_R3, SSL_CURVE_X25519_KYBER512_R3, "X25519_Kyber512_R3", "x25519_kyber512_r3"},
+};
+
+// The key share sizes are taken from the corresponding specification.
+//
+// Kyber Round 3: https://pq-crystals.org/kyber/data/kyber-specification-round3-20210804.pdf
+// SECP256R1:     https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.8.2
+// X25519:        https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.8.2
+static const size_t p256_share_size = ((32 * 2) + 1);
+static const size_t x25519_share_size = 32;
+static const size_t kyber512_r3_public_key_size = 800;
+static const size_t kyber512_r3_ciphertext_size = 768;
+CONSTEXPR_ARRAY HybridGroup kHybridGroups[] = {
+  {
+    SSL_CURVE_SECP256R1_KYBER512_R3,  // group_id
+    {
+      SSL_CURVE_SECP256R1,            // component_group_ids[0]
+      SSL_CURVE_KYBER512_R3,          // component_group_ids[1]
+    },
+    {
+      p256_share_size,                // offer_share_sizes[0]
+      kyber512_r3_public_key_size,    // offer_share_sizes[1]
+    },
+    {
+      p256_share_size,                // accept_share_sizes[0]
+      kyber512_r3_ciphertext_size,    // accept_share_sizes[1]
+    },
+  },
+
+  {
+    SSL_CURVE_X25519_KYBER512_R3,     // group_id
+    {
+      SSL_CURVE_X25519,               // component_group_ids[0]
+      SSL_CURVE_KYBER512_R3,          // component_group_ids[1]
+    },
+    {
+      x25519_share_size,              // offer_share_sizes[0]
+      kyber512_r3_public_key_size,    // offer_share_sizes[1]
+    },
+    {
+      x25519_share_size,              // accept_share_sizes[0]
+      kyber512_r3_ciphertext_size,    // accept_share_sizes[1]
+    },
+  }
 };
 
 CONSTEXPR_ARRAY uint16_t kPQGroups[] = {
-    SSL_CURVE_CECPQ2,
-    SSL_CURVE_KYBER512_R3,
+  SSL_CURVE_CECPQ2,
+  SSL_CURVE_KYBER512_R3,
+  SSL_CURVE_SECP256R1_KYBER512_R3,
+  SSL_CURVE_X25519_KYBER512_R3,
 };
 
 }  // namespace
 
 Span<const NamedGroup> NamedGroups() {
   return MakeConstSpan(kNamedGroups, OPENSSL_ARRAY_SIZE(kNamedGroups));
+}
+
+Span<const HybridGroup> HybridGroups() {
+  return MakeConstSpan(kHybridGroups, OPENSSL_ARRAY_SIZE(kHybridGroups));
 }
 
 Span<const uint16_t> PQGroups() {
@@ -571,6 +851,10 @@ UniquePtr<SSLKeyShare> SSLKeyShare::Create(uint16_t group_id) {
       return MakeUnique<X25519KeyShare>();
     case SSL_CURVE_CECPQ2:
       return MakeUnique<CECPQ2KeyShare>();
+    case SSL_CURVE_SECP256R1_KYBER512_R3:
+      return MakeUnique<HybridKeyShare>(SSL_CURVE_SECP256R1_KYBER512_R3);
+    case SSL_CURVE_X25519_KYBER512_R3:
+      return MakeUnique<HybridKeyShare>(SSL_CURVE_X25519_KYBER512_R3);
     case SSL_CURVE_KYBER512_R3:
       // Kyber, as a standalone group, is not a NamedGroup; however, we
       // need to create Kyber key shares as part of hybrid groups.
