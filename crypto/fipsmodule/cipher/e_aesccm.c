@@ -63,6 +63,7 @@ struct ccm128_context {
   block128_f block;
   ctr128_f ctr;
   unsigned M, L;
+  void *key;
 };
 
 struct ccm128_state {
@@ -70,6 +71,25 @@ struct ccm128_state {
     uint64_t u[2];
     uint8_t c[16];
   } nonce, cmac;
+};
+
+struct aead_aes_ccm_ctx {
+  union {
+    double align;
+    AES_KEY ks;
+  } ks;
+  struct ccm128_context ccm;
+};
+
+struct cipher_aes_ccm_ctx {
+  int key_set;                       // Set if key initialised
+  int iv_set;                        // Set if an iv is set
+  int tag_set;                       // Set if tag is valid
+  int len_set;                       // Set if message length set
+  int tls_aad_len;                   // TLS AAD length
+  unsigned M, L;
+  struct ccm128_state state;
+  EVP_AEAD_CTX aead_ctx;  // TODO NOTE: aead_ctx->state == aead_aes_ccm_ctx
 };
 
 static int CRYPTO_ccm128_init(struct ccm128_context *ctx, const AES_KEY *key,
@@ -88,6 +108,20 @@ static int CRYPTO_ccm128_init(struct ccm128_context *ctx, const AES_KEY *key,
 static size_t CRYPTO_ccm128_max_input(const struct ccm128_context *ctx) {
   return ctx->L >= sizeof(size_t) ? (size_t)-1
                                   : (((size_t)1) << (ctx->L * 8)) - 1;
+}
+
+static size_t CRYPTO_ccm128_tag(const struct ccm128_state *state, uint8_t *tag,
+                                size_t len) {
+  unsigned int M = (state->nonce.c[0] >> 3) & 7;
+  M *= 2;
+  M += 2;
+
+  if (len != M) {
+    return 0;
+  }
+
+  memcpy(tag, state->cmac.c, M);
+  return M;
 }
 
 static int ccm128_init_state(const struct ccm128_context *ctx,
@@ -268,14 +302,6 @@ static int CRYPTO_ccm128_decrypt(const struct ccm128_context *ctx,
 
 #define EVP_AEAD_AES_CCM_MAX_TAG_LEN 16
 
-struct aead_aes_ccm_ctx {
-  union {
-    double align;
-    AES_KEY ks;
-  } ks;
-  struct ccm128_context ccm;
-};
-
 OPENSSL_STATIC_ASSERT(sizeof(((EVP_AEAD_CTX *)NULL)->state) >=
                           sizeof(struct aead_aes_ccm_ctx),
                       AEAD_state_is_too_small)
@@ -286,9 +312,23 @@ OPENSSL_STATIC_ASSERT(alignof(union evp_aead_ctx_st_state) >=
 static int aead_aes_ccm_init(EVP_AEAD_CTX *ctx, const uint8_t *key,
                              size_t key_len, size_t tag_len, unsigned M,
                              unsigned L) {
-  assert(M == EVP_AEAD_max_overhead(ctx->aead));
-  assert(M == EVP_AEAD_max_tag_len(ctx->aead));
-  assert(15 - L == EVP_AEAD_nonce_length(ctx->aead));
+  if (ctx->aead->aead_id == AEAD_AES_128_CCM_BLUETOOTH_ID ||
+      ctx->aead->aead_id == AEAD_AES_128_CCM_BLUETOOTH_8_ID ||
+      ctx->aead->aead_id == AEAD_AES_128_CCM_MATTER_ID) {
+    assert(M == EVP_AEAD_max_overhead(ctx->aead));
+    assert(M == EVP_AEAD_max_tag_len(ctx->aead));
+    assert(15 - L == EVP_AEAD_nonce_length(ctx->aead));
+  } else if (ctx->aead->aead_id == AEAD_AES_128_CCM_ID /* ||
+   TODO      ctx->aead->aead_id == AEAD_AES_192_CCM_ID ||
+             ctx->aead->aead_id == AEAD_AES_256_CCM_ID */) {
+    assert(M <= EVP_AEAD_max_overhead(ctx->aead));
+    assert(M <= EVP_AEAD_max_tag_len(ctx->aead));
+    // Cannot assert anything about L since it can be set by the caller
+  } else {
+    // TODO put_error
+    // We shouldn't ever hit this branch
+    return 0;
+  }
 
   if (key_len != EVP_AEAD_key_length(ctx->aead)) {
     OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_BAD_KEY_LENGTH);
@@ -319,11 +359,14 @@ static int aead_aes_ccm_init(EVP_AEAD_CTX *ctx, const uint8_t *key,
 
 static void aead_aes_ccm_cleanup(EVP_AEAD_CTX *ctx) {}
 
-static int aead_aes_ccm_seal_scatter(
-    const EVP_AEAD_CTX *ctx, uint8_t *out, uint8_t *out_tag,
-    size_t *out_tag_len, size_t max_out_tag_len, const uint8_t *nonce,
-    size_t nonce_len, const uint8_t *in, size_t in_len, const uint8_t *extra_in,
-    size_t extra_in_len, const uint8_t *ad, size_t ad_len) {
+static int aead_aes_ccm_seal_scatter(const EVP_AEAD_CTX *ctx, uint8_t *out,
+                                     uint8_t *out_tag, size_t *out_tag_len,
+                                     size_t max_out_tag_len,
+                                     const uint8_t *nonce, size_t nonce_len,
+                                     const uint8_t *in, size_t in_len,
+                                     const uint8_t *extra_in,
+                                     size_t extra_in_len, const uint8_t *ad,
+                                     size_t ad_len) {
   const struct aead_aes_ccm_ctx *ccm_ctx =
       (struct aead_aes_ccm_ctx *)&ctx->state;
 
@@ -455,4 +498,238 @@ DEFINE_METHOD_FUNCTION(EVP_AEAD, EVP_aead_aes_128_ccm_matter) {
   out->cleanup = aead_aes_ccm_cleanup;
   out->seal_scatter = aead_aes_ccm_seal_scatter;
   out->open_gather = aead_aes_ccm_open_gather;
+}
+
+static int aead_aes_128_ccm_init(EVP_AEAD_CTX *ctx, const uint8_t *key,
+                                 size_t key_len, size_t tag_len) {
+  struct aead_aes_ccm_ctx *ccm_ctx = (struct aead_aes_ccm_ctx *)&ctx->state;
+  return aead_aes_ccm_init(ctx, key, key_len, tag_len, tag_len, ccm_ctx->ccm.L);
+}
+
+static void aead_aes_128_ccm_cleanup(EVP_AEAD_CTX *ctx) {}
+
+static int aead_aes_128_ccm_seal_scatter(const EVP_AEAD_CTX *ctx, uint8_t *out, uint8_t *out_tag,
+                                         size_t *out_tag_len, size_t max_out_tag_len,
+                                         const uint8_t *nonce, size_t nonce_len, const uint8_t *in,
+                                         size_t in_len, const uint8_t *extra_in,
+                                         size_t extra_in_len, const uint8_t *ad, size_t ad_len) {
+  return 1;
+}
+
+static int aead_aes_128_ccm_open_gather(const EVP_AEAD_CTX *ctx, uint8_t *out,
+                                        const uint8_t *nonce, size_t nonce_len, const uint8_t *in,
+                                        size_t in_len, const uint8_t *in_tag, size_t in_tag_len,
+                                        const uint8_t *ad, size_t ad_len) {
+  return 1;
+}
+
+static const EVP_AEAD aead_aes_128_ccm = {
+  .key_len =                          16,
+  // Default IV length for AES-CCM is 7. This EVP_AEAD is only used inside an
+  // EVP_CIPHER_CTX wrapper, the caller can set a custom nonce length through
+  // the EVP_CIPHER_CTX_ctrl API and passing in the top-level EVP_CIPHER_CTX
+  // wrapper.
+  .nonce_len =                        7,
+  .overhead =                         16,
+  .max_tag_len =                      16,
+  .aead_id =                          AEAD_AES_128_CCM_ID,
+  .seal_scatter_supports_extra_in =   1,
+
+  .init =                             aead_aes_128_ccm_init,
+  .init_with_direction =              NULL,
+  .cleanup =                          aead_aes_128_ccm_cleanup,
+  .open =                             NULL,
+  .seal_scatter =                     aead_aes_128_ccm_seal_scatter,
+  .open_gather =                      aead_aes_128_ccm_open_gather,
+  .get_iv =                           NULL,
+  .tag_len =                          NULL,
+  .serialize_state =                  NULL,
+  .deserialize_state =                NULL,
+};
+
+static int cipher_aes_ccm_init(EVP_CIPHER_CTX *ctx, const uint8_t *key,
+                        const uint8_t *iv, int enc) {
+  struct cipher_aes_ccm_ctx *cipher_ctx = (struct cipher_aes_ccm_ctx *)ctx->cipher_data; // TODO nullcheck?
+
+  if (!iv && !key) {
+    return 1;
+  }
+
+  if (key) {
+    const unsigned key_len = ctx->key_len;
+    if (key_len != ctx->cipher->key_len) {
+      OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_BAD_KEY_LENGTH);
+      return 0;
+    }
+  }
+
+  const EVP_AEAD *aead = NULL;
+
+  switch (ctx->cipher->nid) {
+    case NID_aes_128_ccm:
+      aead = &aead_aes_128_ccm;
+      break;
+    default:
+      return -1; // FIXME
+  }
+
+  struct aead_aes_ccm_ctx *ccm_ctx = (struct aead_aes_ccm_ctx *)&cipher_ctx->aead_ctx.state;
+  ccm_ctx->ccm.M = cipher_ctx->M;
+  ccm_ctx->ccm.L = cipher_ctx->L;
+  EVP_AEAD_CTX_init(&cipher_ctx->aead_ctx, aead, key, ctx->key_len, cipher_ctx->M, NULL);
+
+
+  return 1;
+}
+
+static int cipher_aes_ccm_cipher(EVP_CIPHER_CTX *ctx, uint8_t *out, const uint8_t *in,
+                          size_t len) {
+  return 1;
+}
+
+static void cipher_aes_ccm_cleanup(EVP_CIPHER_CTX *ctx) {}
+
+static int cipher_aes_ccm_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg, void *ptr) {
+  // TODO null check ctx?????
+  // TODO or maybe those wrapper/getting functions/macros
+  struct cipher_aes_ccm_ctx *cipher_ctx = (struct cipher_aes_ccm_ctx *)ctx->cipher_data;
+
+  switch (type) {
+    case EVP_CTRL_INIT:
+      cipher_ctx->key_set = 0;
+      cipher_ctx->iv_set = 0;
+      // The default values for AES-CCM are L = 8 and M = 12. The caller can
+      // set custom values by additional calls to EVP_CIPHER_CTX_ctrl.
+      cipher_ctx->L = 8;
+      cipher_ctx->M = 12;
+      cipher_ctx->tag_set = 0;
+      cipher_ctx->len_set = 0;
+      cipher_ctx->tls_aad_len = -1;
+      return 1;
+
+    case EVP_CTRL_GET_IVLEN:
+      *(unsigned *)ptr = 15 - cipher_ctx->L;
+      return 1;
+
+    case EVP_CTRL_AEAD_TLS1_AAD:
+      // Save the AAD for later use
+      if (arg != EVP_AEAD_TLS1_AAD_LEN) {
+        return 0;
+      }
+      // TODO ctx->buf weird wrapper macro? EVP_CIPHER_CTX_buf_noconst??
+      memcpy(ctx->buf, ptr, arg);
+      cipher_ctx->tls_aad_len = arg;
+      uint16_t len = ctx->buf[arg - 2] << 8 | ctx->buf[arg - 1];
+
+      // Correct length for explicit IV
+      if (len < EVP_CCM_TLS_EXPLICIT_IV_LEN) {
+        return 0;
+      }
+
+      len -= EVP_CCM_TLS_EXPLICIT_IV_LEN;
+
+      // If decrypting, correct for tag too
+      if (!ctx->encrypt) {
+        if (len < cipher_ctx->M) {
+          return 0;
+        }
+
+        len -= cipher_ctx->M;
+      }
+
+      ctx->buf[arg - 2] = len >> 8; // TODO ctx->buf weird wrapper macro? EVP_CIPHER_CTX_buf_noconst??
+      ctx->buf[arg - 1] = len & 0xff;
+
+      // Extra padding: tag appended to record
+      return (int)cipher_ctx->M;
+
+    case EVP_CTRL_CCM_SET_IV_FIXED:
+      // Sanity check length
+      if (arg != EVP_CCM_TLS_FIXED_IV_LEN) {
+        return 0;
+      }
+
+      // Just copy to first part of IV
+      memcpy(ctx->iv, ptr, arg);
+      return 1;
+
+    case EVP_CTRL_AEAD_SET_IVLEN:
+      arg = 15 - arg;
+      // Fall through
+    case EVP_CTRL_CCM_SET_L:
+      if (arg < 2 || arg > 8) {
+        return 0;
+      }
+      cipher_ctx->L = arg;
+      return 1;
+
+    case EVP_CTRL_AEAD_SET_TAG:
+      if ((arg & 1) || arg < 4 || arg > 16) {
+        return 0;
+      }
+
+      if (ctx->encrypt && ptr) {
+        return 0;
+      }
+
+      if (ptr) {
+        cipher_ctx->tag_set = 1;
+        memcpy(ctx->buf, ptr, arg);
+      }
+      cipher_ctx->M = arg;
+      return 1;
+
+    case EVP_CTRL_AEAD_GET_TAG:
+      if (!ctx->encrypt || !cipher_ctx->tag_set) {
+        return 0;
+      }
+
+      if (!CRYPTO_ccm128_tag(&cipher_ctx->state, ptr, (size_t)arg)) {
+        return 0;
+      }
+
+      cipher_ctx->tag_set = 0;
+      cipher_ctx->iv_set = 0;
+      cipher_ctx->len_set = 0;
+      return 1;
+
+    case EVP_CTRL_COPY:
+    {
+      struct aead_aes_ccm_ctx *ccm_ctx = (struct aead_aes_ccm_ctx *)&cipher_ctx->aead_ctx.state;
+      EVP_CIPHER_CTX *out = (EVP_CIPHER_CTX *)ptr;
+      struct cipher_aes_ccm_ctx *out_cipher_ctx = (struct cipher_aes_ccm_ctx *)out->cipher_data;
+      struct aead_aes_ccm_ctx *out_ccm_ctx = (struct aead_aes_ccm_ctx *)&out_cipher_ctx->aead_ctx.state;
+
+      if (ccm_ctx->ccm.key) {
+        if (ccm_ctx->ccm.key != &ccm_ctx->ks) {
+          return 0;
+        }
+        out_ccm_ctx->ccm.key = &out_ccm_ctx->ks;
+      }
+      return 1;
+    }
+
+    default:
+      return -1;
+  }
+}
+
+DEFINE_METHOD_FUNCTION(EVP_CIPHER, EVP_aes_128_ccm) {
+  memset(out, 0, sizeof(EVP_CIPHER));
+
+  out->nid = NID_aes_128_ccm;
+  out->block_size = 1;
+  out->key_len = 16;
+
+  // Default IV length for AES-CCM is 7. Caller can set a custom IV length in
+  // the context using EVP_CIPHER_CTX_ctrl with EVP_CTRL_AEAD_SET_IVLEN.
+  out->iv_len = 7;
+  out->ctx_size = sizeof(struct cipher_aes_ccm_ctx);
+  out->flags = EVP_CIPH_CCM_MODE | EVP_CIPH_CUSTOM_IV | EVP_CIPH_CUSTOM_COPY |
+               EVP_CIPH_FLAG_CUSTOM_CIPHER | EVP_CIPH_ALWAYS_CALL_INIT |
+               EVP_CIPH_CTRL_INIT | EVP_CIPH_FLAG_AEAD_CIPHER;
+  out->init = cipher_aes_ccm_init;
+  out->cipher = cipher_aes_ccm_cipher;
+  out->cleanup = cipher_aes_ccm_cleanup;
+  out->ctrl = cipher_aes_ccm_ctrl;
 }

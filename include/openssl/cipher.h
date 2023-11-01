@@ -346,12 +346,12 @@ OPENSSL_EXPORT int EVP_BytesToKey(const EVP_CIPHER *type, const EVP_MD *md,
 #define EVP_CIPH_CTR_MODE 0x5
 #define EVP_CIPH_GCM_MODE 0x6
 #define EVP_CIPH_XTS_MODE 0x7
+#define EVP_CIPH_CCM_MODE 0x8
 
 // Buffer length in bits not bytes: CFB1 mode only.
 # define EVP_CIPH_FLAG_LENGTH_BITS 0x2000
 // The following values are never returned from |EVP_CIPHER_mode| and are
 // included only to make it easier to compile code with BoringSSL.
-#define EVP_CIPH_CCM_MODE 0x8
 #define EVP_CIPH_OCB_MODE 0x9
 #define EVP_CIPH_WRAP_MODE 0xa
 
@@ -485,6 +485,19 @@ OPENSSL_EXPORT const EVP_CIPHER *EVP_get_cipherbyname(const char *name);
 OPENSSL_EXPORT const EVP_CIPHER *EVP_aes_128_gcm(void);
 OPENSSL_EXPORT const EVP_CIPHER *EVP_aes_256_gcm(void);
 
+// These AES-CCM implementations are legacy and included for compatibility.
+// Avoid using them unless necessary.
+//
+// WARNING: As with the AES-GCM APIs above, these AES-CCM APIs allow streaming
+// operations that are NOT SECURE while decryption is ongoing. Until calling
+// |EVP_DecryptFinal_ex|, the tag has not yet been checked and output released
+// by |EVP_DecryptUpdate| is unauthenticated and easily manipulated by
+// attackers. Callers must buffer the output and should not act on it until it
+// has been successfully authenticated by calling |EVP_DecryptFinal_ex|.
+OPENSSL_EXPORT const EVP_CIPHER *EVP_aes_128_ccm(void);
+OPENSSL_EXPORT const EVP_CIPHER *EVP_aes_192_ccm(void);
+OPENSSL_EXPORT const EVP_CIPHER *EVP_aes_256_ccm(void);
+
 // These are deprecated, 192-bit version of AES.
 OPENSSL_EXPORT const EVP_CIPHER *EVP_aes_192_ecb(void);
 OPENSSL_EXPORT const EVP_CIPHER *EVP_aes_192_cbc(void);
@@ -578,6 +591,21 @@ OPENSSL_EXPORT void EVP_CIPHER_CTX_set_flags(const EVP_CIPHER_CTX *ctx,
 #define EVP_CTRL_AEAD_SET_MAC_KEY 0x17
 // EVP_CTRL_GCM_SET_IV_INV sets the GCM invocation field, decrypt only
 #define EVP_CTRL_GCM_SET_IV_INV 0x18
+#define EVP_CTRL_CCM_SET_L 0x14
+#define EVP_CTRL_GET_IVLEN 0x25
+# define EVP_CTRL_CCM_SET_IV_FIXED EVP_CTRL_AEAD_SET_IV_FIXED
+
+// CCM TLS constants
+// Length of fixed part of IV derived from PRF
+# define EVP_CCM_TLS_FIXED_IV_LEN 4
+// Length of explicit part of IV part of TLS records
+# define EVP_CCM_TLS_EXPLICIT_IV_LEN 8
+// Total length of CCM IV length for TLS
+# define EVP_CCM_TLS_IV_LEN 12
+// Length of tag for TLS
+# define EVP_CCM_TLS_TAG_LEN 16
+// Length of CCM8 tag for TLS
+# define EVP_CCM8_TLS_TAG_LEN 8
 
 // The following constants are unused.
 #define EVP_GCM_TLS_FIXED_IV_LEN 4
